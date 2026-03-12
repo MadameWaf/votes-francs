@@ -1,0 +1,361 @@
+# =========================================================
+# 0) Packages
+# =========================================================
+library(arrow)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(sf)
+library(leaflet)
+library(htmlwidgets)
+
+# =========================================================
+# 1) Read election parquet
+# =========================================================
+setwd("")
+votes <- open_dataset("your_file.parquet")
+
+# =========================================================
+# 2) Candidate -> party crosswalk
+# Edit this table if you want different parties
+# =========================================================
+party_map <- tribble(
+  ~annee, ~nom,        ~party,
+   2007,  "ROYAL",     "PS",
+   2012,  "HOLLANDE",  "PS",
+   2017,  "HAMON",     "PS",
+   2022,  "HIDALGO",   "PS",
+   2007,  "SARKOZY",   "LR",
+   2012,  "SARKOZY",   "LR",
+   2017,  "FILLON",    "LR",
+   2022,  "PECRESSE",  "LR"
+)
+
+# =========================================================
+# 3) Keep only presidential first rounds: 2007, 2012, 2017, 2022
+# =========================================================
+election_lookup <- tribble(
+  ~id_election,    ~annee,
+  "2007_pres_t1",  2007,
+  "2012_pres_t1",  2012,
+  "2017_pres_t1",  2017,
+  "2022_pres_t1",  2022
+)
+
+votes_1st_round <- votes %>%
+  filter(id_election %in% election_lookup$id_election) %>%
+  select(
+    id_election,
+    id_brut_miom,
+    code_departement,
+    code_commune,
+    code_bv,
+    nom,
+    voix
+  ) %>%
+  collect() %>%
+  left_join(election_lookup, by = "id_election")
+
+# =========================================================
+# 4) Total expressed votes by bureau-year
+# Since the file is candidate x bureau, expressed votes are the sum of candidate votes
+# =========================================================
+exprimes_bureau <- votes_1st_round %>%
+  group_by(
+    annee,
+    id_brut_miom,
+    code_departement,
+    code_commune,
+    code_bv
+  ) %>%
+  summarise(
+    total_exprimes = sum(voix, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 5) Keep only selected parties and aggregate votes by bureau-year-party
+# =========================================================
+party_votes <- votes_1st_round %>%
+  inner_join(party_map, by = c("annee", "nom")) %>%
+  group_by(
+    annee,
+    party,
+    id_brut_miom,
+    code_departement,
+    code_commune,
+    code_bv
+  ) %>%
+  summarise(
+    voix_party = sum(voix, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 6) Compute ratio of expressed votes by bureau-year-party
+# =========================================================
+bureau_party_ratio <- party_votes %>%
+  left_join(
+    exprimes_bureau,
+    by = c("annee", "id_brut_miom", "code_departement", "code_commune", "code_bv")
+  ) %>%
+  mutate(
+    ratio_voix_exprimes_party = voix_party / total_exprimes
+  ) %>%
+  arrange(party, id_brut_miom, annee) %>%
+  collect()
+
+# =========================================================
+# 7) Wide table: one row = bureau x party
+# Missing values are replaced with 0
+# =========================================================
+changes_by_bureau <- bureau_party_ratio %>%
+  select(
+    id_brut_miom,
+    code_departement,
+    code_commune,
+    code_bv,
+    party,
+    annee,
+    ratio_voix_exprimes_party
+  ) %>%
+  pivot_wider(
+    names_from = annee,
+    values_from = ratio_voix_exprimes_party,
+    values_fill = 0
+  ) %>%
+  mutate(
+    diff_2007_2012 = `2012` - `2007`,
+    diff_2012_2017 = `2017` - `2012`,
+    diff_2017_2022 = `2022` - `2017`,
+    diff_2007_2022 = `2022` - `2007`
+  )
+
+# =========================================================
+# 8) Standard deviation of changes by party
+# =========================================================
+sd_changes <- changes_by_bureau %>%
+  group_by(party) %>%
+  summarise(
+    sd_2007_2012 = sd(diff_2007_2012, na.rm = TRUE),
+    sd_2012_2017 = sd(diff_2012_2017, na.rm = TRUE),
+    sd_2017_2022 = sd(diff_2017_2022, na.rm = TRUE),
+    sd_2007_2022 = sd(diff_2007_2022, na.rm = TRUE),
+
+    n_2007_2012 = sum(!is.na(diff_2007_2012)),
+    n_2012_2017 = sum(!is.na(diff_2012_2017)),
+    n_2017_2022 = sum(!is.na(diff_2017_2022)),
+    n_2007_2022 = sum(!is.na(diff_2007_2022)),
+    .groups = "drop"
+  )
+
+# =========================================================
+# 9) Export result tables
+# =========================================================
+write_csv(bureau_party_ratio, "bureau_party_ratio_2007_2022_t1.csv")
+write_csv(changes_by_bureau, "bureau_party_changes_2007_2022_t1.csv")
+write_csv(sd_changes, "party_sd_changes_2007_2022_t1.csv")
+
+# =========================================================
+# 10) Prepare spatial object
+# Assumes bureaux_sf is already loaded as an sf object
+# and contains codeBureauVote
+# =========================================================
+bureaux_sf <- bureaux_sf %>%
+  mutate(
+    codeBureauVote = as.character(codeBureauVote)
+  )
+
+# =========================================================
+# 11) Build map dataset
+# Choose what to map here
+# =========================================================
+
+# -----------------------------------------
+# OPTION A: vote share level
+# Example: PS in 2022
+# -----------------------------------------
+results_map <- bureau_party_ratio %>%
+  filter(annee == 2022, party == "PS") %>%
+  select(
+    id_brut_miom,
+    party,
+    annee,
+    ratio_voix_exprimes_party
+  ) %>%
+  mutate(id_brut_miom = as.character(id_brut_miom))
+
+map_sf <- bureaux_sf %>%
+  left_join(results_map, by = c("codeBureauVote" = "id_brut_miom"))
+
+# =========================================================
+# 12) Interactive leaflet map for vote share
+# =========================================================
+pal_ratio <- colorNumeric(
+  palette = "viridis",
+  domain = map_sf$ratio_voix_exprimes_party,
+  na.color = "#d9d9d9"
+)
+
+popup_ratio <- paste0(
+  "<b>Bureau:</b> ", map_sf$codeBureauVote, "<br/>",
+  "<b>Party:</b> ", map_sf$party, "<br/>",
+  "<b>Year:</b> ", map_sf$annee, "<br/>",
+  "<b>Vote share:</b> ", round(map_sf$ratio_voix_exprimes_party, 3)
+)
+
+m_ratio <- leaflet(map_sf) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal_ratio(ratio_voix_exprimes_party),
+    fillOpacity = 0.8,
+    color = "white",
+    weight = 0.3,
+    smoothFactor = 0.2,
+    popup = popup_ratio,
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#333333",
+      fillOpacity = 0.95,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal_ratio,
+    values = ~ratio_voix_exprimes_party,
+    title = "PS vote share (2022)",
+    opacity = 0.8
+  )
+
+# Display in RStudio Viewer
+m_ratio
+
+# Save as HTML
+saveWidget(m_ratio, "interactive_map_ratio_PS_2022.html", selfcontained = TRUE)
+
+# =========================================================
+# 13) Interactive leaflet map for change
+# Example: PS change from 2017 to 2022
+# =========================================================
+results_change <- changes_by_bureau %>%
+  filter(party == "PS") %>%
+  select(
+    id_brut_miom,
+    party,
+    diff_2017_2022
+  ) %>%
+  mutate(id_brut_miom = as.character(id_brut_miom))
+
+map_sf_change <- bureaux_sf %>%
+  left_join(results_change, by = c("codeBureauVote" = "id_brut_miom"))
+
+pal_change <- colorNumeric(
+  palette = colorRampPalette(c("blue", "white", "red"))(200),
+  domain = map_sf_change$diff_2017_2022,
+  na.color = "#d9d9d9"
+)
+
+popup_change <- paste0(
+  "<b>Bureau:</b> ", map_sf_change$codeBureauVote, "<br/>",
+  "<b>Party:</b> ", map_sf_change$party, "<br/>",
+  "<b>Change 2017-2022:</b> ", round(map_sf_change$diff_2017_2022, 3)
+)
+
+m_change <- leaflet(map_sf_change) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal_change(diff_2017_2022),
+    fillOpacity = 0.8,
+    color = "white",
+    weight = 0.3,
+    smoothFactor = 0.2,
+    popup = popup_change,
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#333333",
+      fillOpacity = 0.95,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal_change,
+    values = ~diff_2017_2022,
+    title = "PS change in vote share (2017-2022)",
+    opacity = 0.8
+  )
+
+# Display in RStudio Viewer
+m_change
+
+# Save as HTML
+saveWidget(m_change, "interactive_map_change_PS_2017_2022.html", selfcontained = TRUE)
+
+# =========================================================
+# 14) Optional: one interactive map with both PS and LR in 2022
+# =========================================================
+results_both <- bureau_party_ratio %>%
+  filter(annee == 2022, party %in% c("PS", "LR")) %>%
+  select(id_brut_miom, party, ratio_voix_exprimes_party) %>%
+  mutate(id_brut_miom = as.character(id_brut_miom))
+
+map_ps <- bureaux_sf %>%
+  left_join(
+    results_both %>% filter(party == "PS"),
+    by = c("codeBureauVote" = "id_brut_miom")
+  )
+
+map_lr <- bureaux_sf %>%
+  left_join(
+    results_both %>% filter(party == "LR"),
+    by = c("codeBureauVote" = "id_brut_miom")
+  )
+
+pal_ps <- colorNumeric("Blues", domain = map_ps$ratio_voix_exprimes_party, na.color = "#d9d9d9")
+pal_lr <- colorNumeric("Reds",  domain = map_lr$ratio_voix_exprimes_party, na.color = "#d9d9d9")
+
+m_layers <- leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    data = map_ps,
+    fillColor = ~pal_ps(ratio_voix_exprimes_party),
+    fillOpacity = 0.8,
+    color = "white",
+    weight = 0.3,
+    group = "PS",
+    popup = ~paste0(
+      "<b>Bureau:</b> ", codeBureauVote, "<br/>",
+      "<b>PS 2022:</b> ", round(ratio_voix_exprimes_party, 3)
+    )
+  ) %>%
+  addPolygons(
+    data = map_lr,
+    fillColor = ~pal_lr(ratio_voix_exprimes_party),
+    fillOpacity = 0.8,
+    color = "white",
+    weight = 0.3,
+    group = "LR",
+    popup = ~paste0(
+      "<b>Bureau:</b> ", codeBureauVote, "<br/>",
+      "<b>LR 2022:</b> ", round(ratio_voix_exprimes_party, 3)
+    )
+  ) %>%
+  addLayersControl(
+    overlayGroups = c("PS", "LR"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  hideGroup("LR")
+
+# Display in RStudio Viewer
+m_layers
+
+# Save as HTML
+saveWidget(m_layers, "interactive_map_layers_PS_LR_2022.html", selfcontained = TRUE)
+
+# =========================================================
+# 15) Print summary outputs
+# =========================================================
+print(sd_changes)
