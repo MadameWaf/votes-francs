@@ -163,6 +163,7 @@ write_csv(sd_changes, "party_sd_changes_2007_2022_t1.csv")
 # Assumes bureaux_sf is already loaded as an sf object
 # and contains codeBureauVote
 # =========================================================
+bureaux_sf <- st_read("contours-france-entiere-latest-v2.geojson")
 bureaux_sf <- bureaux_sf %>%
   mutate(
     codeBureauVote = as.character(codeBureauVote)
